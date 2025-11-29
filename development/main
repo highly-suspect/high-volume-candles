@@ -1,0 +1,357 @@
+//@version=6
+indicator("High Volume Bars (Advanced)", overlay = true, max_bars_back = 500, format = format.volume, precision = 0)
+
+//=== Inputs ===//
+group_stats   = "Statistics"
+group_mode    = "Detection Mode"
+group_visuals = "Visuals"
+group_fail    = "Follow-Through Failures"
+group_filter  = "Quality Filters"
+group_trend   = "Trend Context"
+group_vwap    = "VWAP Proximity Filter"
+group_cluster = "Clustering / Cooldown"
+group_extreme = "Extreme Break"
+group_htfr    = "HTF Range State"
+group_session = "Session Filter"
+group_absorb  = "Absorption / Reversal"
+group_venues  = "Multi-Venue Volume"
+
+len             = input.int(120, "Lookback", minval = 5, group = group_stats, tooltip = "Bars sampled for baseline volume stats (SMA/EMA or Median).")
+mult            = input.float(1.0, "StdDev / Z-Score Multiplier", step = 0.1, minval = 0.1, group = group_stats, tooltip = "How many deviations above baseline to flag as high-volume.")
+smooth_with_ema = input.bool(true, "Use EMA Instead of SMA?", group = group_stats, tooltip = "EMA reacts faster to shifts; SMA is steadier.")
+use_robust      = input.bool(true, "Use Robust Stats (Median & MAD)?", group = group_stats, tooltip = "Median/MAD reduce outlier influence on the bands.")
+
+mode_change     = input.bool(false, "Use Volume Change vs Previous Bar?", group = group_mode, tooltip = "Detect spikes in absolute change vs the prior bar (ignored when Z-Score is enabled).")
+mode_zscore     = input.bool(true, "Use Z-Score on Volume?", group = group_mode, tooltip = "Standardize volume with Z-Score; overrides Absolute/Change modes.")
+
+min_rel_mult    = input.float(0.0, "Min Volume vs Avg (Filter)", minval = 0.0, step = 0.1, group = group_mode, tooltip = "Optional filter: require the chosen volume source to be at least N× its baseline mean.")
+skip_open_bars  = input.int(0, "Skip First N Bars (from start of chart)", minval = 0, maxval = 60, group = group_mode, tooltip = "Ignore the first N bars to avoid distorted early stats.")
+
+use_bg          = input.bool(false, "Also Highlight Background?", group = group_visuals, tooltip = "Shade the chart background when a high-volume bar occurs.")
+bar_transp      = input.int(0, "High-Vol Bar Transparency (0–100)", minval = 0, maxval = 100, group = group_visuals, tooltip = "Adjust visibility of highlighted bars.")
+
+upColor         = input.color(color.new(#4490f9, 50), "Up Color", group = group_visuals, tooltip = "Default color for up bars (non high-volume).")
+dnColor         = input.color(color.new(#000000, 90), "Down Color", group = group_visuals, tooltip = "Default color for down bars (non high-volume).")
+
+upHighVolBase   = input.color(#45a649, "Up High-Vol Base Color", group = group_visuals, tooltip = "Base color for up high-volume bars (transparency applied).")
+dnHighVolBase   = input.color(#7f4cb6, "Down High-Vol Base Color", group = group_visuals, tooltip = "Base color for down high-volume bars (transparency applied).")
+bgHighVolColor  = input.color(color.new(#ffffff, 90), "High-Vol Background", group = group_visuals, tooltip = "Background shade for high-volume bars when enabled.")
+failLookahead   = input.int(5, "Lookahead Bars", minval = 1, maxval = 50, group = group_fail, tooltip = "Bars to wait before judging if a high-volume bar got follow-through.")
+failMovePct     = input.float(0.5, "Opposite Move vs Bar Range (%)", minval = 0.0, step = 0.05, group = group_fail, tooltip = "Fraction of the bar's range the market must move in the opposite direction to flag failed follow-through.")
+failAtrMult     = input.float(0.5, "Opposite Move vs ATR (mult)", minval = 0.0, step = 0.1, group = group_fail, tooltip = "ATR-based floor for the opposite move to count as failed follow-through.")
+showFailMarks   = input.bool(true, "Mark Failed Follow-Through Bars", group = group_fail, tooltip = "Highlight high-volume bars where price later moved meaningfully against them.")
+failBuyColor    = input.color(color.new(#ff6f61, 0), "Failed Buy Color", group = group_fail, tooltip = "Marker color for failed high-volume buys (price fell afterward).")
+failSellColor   = input.color(color.new(#4caf50, 0), "Failed Sell Color", group = group_fail, tooltip = "Marker color for failed high-volume sells (price rose afterward).")
+useVwapProx     = input.bool(true, "Require Proximity to VWAP Bands", group = group_vwap, tooltip = "Filter high-volume bars to those near VWAP and its σ bands.")
+vwapAnchor      = input.string("Week", "VWAP Anchor", options = ["Session", "Week", "Month", "Quarter", "Year"], group = group_vwap, tooltip = "Anchor VWAP resets on this period change.")
+vwapTolerancePct= input.float(0.1, "Proximity Tolerance (%)", minval = 0.0, step = 0.05, group = group_vwap, tooltip = "Max distance from VWAP/σ levels as % of price to count as proximal.")
+vwapUse0        = input.bool(true, "Allow VWAP (0σ)", group = group_vwap, inline = "bands")
+vwapUse1        = input.bool(true, "Allow ±1σ", group = group_vwap, inline = "bands")
+vwapUse2        = input.bool(false, "Allow ±2σ", group = group_vwap, inline = "bands")
+vwapTolMinPct   = input.float(0.05, "Min Adaptive VWAP Tolerance (%)", minval = 0.0, step = 0.01, group = group_vwap, tooltip = "Lower bound for adaptive VWAP proximity.")
+vwapTolMaxPct   = input.float(0.25, "Max Adaptive VWAP Tolerance (%)", minval = 0.0, step = 0.01, group = group_vwap, tooltip = "Upper bound for adaptive VWAP proximity.")
+vwapTolAtrMult  = input.float(0.8, "VWAP Tolerance ATR Mult", minval = 0.0, step = 0.05, group = group_vwap, tooltip = "Adaptive tolerance scales with ATR/price * this multiplier.")
+minBodyPct      = input.float(35.0, "Min Body as % of Range", minval = 0.0, maxval = 100, step = 1, group = group_filter, tooltip = "Require real body to be at least this % of the bar's range to avoid doji/high-noise bars.")
+minRangeAtr     = input.float(0.5, "Min Range vs ATR (mult)", minval = 0.0, step = 0.1, group = group_filter, tooltip = "Require bar range to be at least this multiple of ATR(14).")
+useDeltaConfirm = input.bool(true, "Require Strong Synthetic Delta", group = group_filter, tooltip = "Use uptick/downtick proxy to confirm strong directional effort on the bar.")
+deltaMult       = input.float(1.5, "Delta Strength Multiplier", minval = 0.5, step = 0.1, group = group_filter, tooltip = "How many times the baseline delta magnitude is required to call delta 'strong'.")
+deltaLen        = input.int(80, "Delta Baseline Lookback", minval = 10, maxval = 1000, group = group_filter, tooltip = "Lookback for average synthetic delta magnitude.")
+useTrendFilter  = input.bool(true, "Align with HTF Trend", group = group_trend, tooltip = "Only accept signals aligned with higher-timeframe bias.")
+trendTf         = input.timeframe("W", "HTF for Trend", group = group_trend, tooltip = "Higher timeframe used to compute trend bias.")
+trendMaLen      = input.int(90, "HTF Trend MA Length", minval = 1, maxval = 500, group = group_trend, tooltip = "Length for HTF moving average.")
+clusterWindow   = input.int(2, "Cluster Window (bars)", minval = 1, maxval = 50, group = group_cluster, tooltip = "Require at least 2 high-volume bars within this window to keep a signal.")
+cooldownBars    = input.int(1, "Cooldown Bars after Signal", minval = 0, maxval = 100, group = group_cluster, tooltip = "Suppress new signals for this many bars after one fires.")
+requireCluster  = input.bool(true, "Enforce Cluster Requirement", group = group_cluster, tooltip = "If on, need >=2 signals inside the window; if off, cluster logic is skipped.")
+useExtremeBreak = input.bool(true, "Require Extreme Break", group = group_extreme, tooltip = "Bar must break prior swing extreme or its own extreme by a tick.")
+swingLen        = input.int(3, "Swing Lookback (bars)", minval = 1, maxval = 100, group = group_extreme, tooltip = "Bars to look back/forward for swing high/low.")
+tickBuffer      = input.float(0.0, "Break Buffer (ticks)", minval = 0.0, step = 0.01, group = group_extreme, tooltip = "Extra distance beyond the extreme to confirm break.")
+requireCloseBeyond = input.bool(false, "Require Close Beyond Swing", group = group_extreme, tooltip = "If on, bar close must break the swing instead of just the wick.")
+useHtfRange     = input.bool(true, "Filter by HTF Range State", group = group_htfr, tooltip = "Allow signals only when HTF range is expanding (ATR rising) or above threshold.")
+htfRangeTf      = input.timeframe("240", "HTF for Range", group = group_htfr, tooltip = "Higher timeframe to measure range/ATR expansion.")
+htfRangeLen     = input.int(14, "HTF ATR Length", minval = 1, maxval = 500, group = group_htfr, tooltip = "ATR length on HTF for expansion filter.")
+htfAtrFloorMult = input.float(1.0, "Min HTF ATR vs MA (mult)", minval = 0.0, step = 0.1, group = group_htfr, tooltip = "Require HTF ATR to be at least this multiple of its own MA to pass.")
+htfAtrMaLen     = input.int(14, "HTF ATR MA Length", minval = 1, maxval = 500, group = group_htfr, tooltip = "Smoothing length for HTF ATR baseline.")
+useSessionFilter = input.bool(false, "Filter by Session", group = group_session, tooltip = "Only allow signals inside the specified session window.")
+sessionWindow    = input.session("0000-2359", "Allowed Session (exchange time)", group = group_session, tooltip = "Session window (exchange time).")
+useAbsorb       = input.bool(false, "Detect Absorption at VWAP Bands", group = group_absorb, tooltip = "Mark absorption/reversal attempts near VWAP/σ/rolling VWAP levels.")
+absorbTolPct    = input.float(0.5, "Absorption Proximity (%)", minval = 0.0, step = 0.05, group = group_absorb, tooltip = "Distance to level as % of price to consider absorption.")
+absorbWickPct   = input.float(50.0, "Min Wick as % Range", minval = 0.0, maxval = 100, step = 1, group = group_absorb, tooltip = "Minimum wick size as % of bar range for absorption.")
+absorbBodyMaxPct= input.float(40.0, "Max Body as % Range", minval = 0.0, maxval = 100, step = 1, group = group_absorb, tooltip = "Maximum body size as % of bar range for absorption.")
+absorbDeltaFlip = input.bool(true, "Require Opposite Synthetic Delta", group = group_absorb, tooltip = "For absorption, require delta opposite the bar direction.")
+useRollVwap     = input.bool(false, "Use Rolling VWAP Confluence", group = group_absorb, tooltip = "Include rolling VWAP/bands in level set for absorption.")
+rollVwapLen     = input.int(100, "Rolling VWAP Length", minval = 5, maxval = 2000, group = group_absorb, tooltip = "Lookback for rolling VWAP.")
+rollBandMult    = input.float(1.0, "Rolling VWAP Band Mult", minval = 0.0, step = 0.1, group = group_absorb, tooltip = "Std-dev multiplier for rolling VWAP bands.")
+useMultiVenue   = input.bool(false, "Use Multi-Venue Volume Context", group = group_venues, tooltip = "Pull volume from additional exchanges/symbols and optionally require primary volume to align.")
+venue1          = input.symbol("", "Secondary Symbol #1", group = group_venues, tooltip = "e.g., BINANCE:BTCUSDT")
+venue2          = input.symbol("", "Secondary Symbol #2", group = group_venues, tooltip = "e.g., OKX:BTCUSDT")
+venue3          = input.symbol("", "Secondary Symbol #3", group = group_venues, tooltip = "e.g., COINBASE:BTCUSD")
+useVenueDiverge = input.bool(false, "Flag Venue Divergence", group = group_venues, tooltip = "Mark bars where primary is high-volume but aggregated venues are not (or vice versa).")
+venueAlignMult  = input.float(1.0, "Primary Volume vs Venue Median (mult)", minval = 0.0, step = 0.1, group = group_venues, tooltip = "Optional requirement: primary volume must exceed venue median by this multiple.")
+enforceVenueAlign = input.bool(false, "Require Primary >= Venue Median * Mult", group = group_venues, tooltip = "If on, primary volume must beat venue median * mult to keep a signal.")
+markVenueOverlap = input.bool(true, "Highlight Overlap Bars", group = group_venues, tooltip = "Color high-volume bars differently when primary volume aligns with venue median.")
+overlapUpColor   = input.color(color.new(color.yellow, 0), "Overlap Up Color", group = group_venues)
+overlapDnColor   = input.color(color.new(#ffd700, 20), "Overlap Down Color", group = group_venues)
+divergeUpColor   = input.color(color.new(color.red, 0), "Divergence Up Color", group = group_venues)
+divergeDnColor   = input.color(color.new(color.blue, 0), "Divergence Down Color", group = group_venues)
+showVenueTooltips = input.bool(false, "Show Divergence Tooltips", group = group_venues, tooltip = "If on, add labels on divergence bars with venue list.")
+
+// Apply transparency *after* inputs so defvals stay const
+upHighVolColor  = color.new(upHighVolBase, bar_transp)
+dnHighVolColor  = color.new(dnHighVolBase, bar_transp)
+
+//=== Helpers ===//
+vol_ma(src, l)   => smooth_with_ema ? ta.ema(src, l) : ta.sma(src, l)
+vol_std(src, l)  => ta.stdev(src, l)
+
+vol_median(src, l) =>
+    ta.percentile_nearest_rank(src, math.max(1, l), 50)
+
+vol_mad(src, l) =>
+    m = vol_median(src, l)
+    ta.percentile_nearest_rank(math.abs(src - m), math.max(1, l), 50)
+
+median_from_array(arr) =>
+    sz = array.size(arr)
+    if sz == 0
+        na
+    else
+        array.sort(arr)
+        mid = sz / 2
+        sz % 2 == 1 ? array.get(arr, mid) : (array.get(arr, mid - 1) + array.get(arr, mid)) / 2
+
+appendVenue(cur, name) =>
+    name == "" ? cur : (cur == "" ? name : cur + "," + name)
+
+//=== Choose source: absolute vs change ===//
+vol_abs    = volume
+vol_change = math.abs(volume - nz(volume[1], volume))
+vol_src    = mode_change ? vol_change : vol_abs
+venue_vols = array.new_float()
+if useMultiVenue
+    if venue1 != ""
+        v1 = request.security(venue1, timeframe.period, volume, barmerge.gaps_on, barmerge.lookahead_on)
+        if not na(v1)
+            array.push(venue_vols, mode_change ? math.abs(v1 - nz(v1[1], v1)) : v1)
+    if venue2 != ""
+        v2 = request.security(venue2, timeframe.period, volume, barmerge.gaps_on, barmerge.lookahead_on)
+        if not na(v2)
+            array.push(venue_vols, mode_change ? math.abs(v2 - nz(v2[1], v2)) : v2)
+    if venue3 != ""
+        v3 = request.security(venue3, timeframe.period, volume, barmerge.gaps_on, barmerge.lookahead_on)
+        if not na(v3)
+            array.push(venue_vols, mode_change ? math.abs(v3 - nz(v3[1], v3)) : v3)
+venue_median = useMultiVenue and array.size(venue_vols) > 0 ? median_from_array(array.copy(venue_vols)) : na
+
+//=== Baseline stats ===//
+vol_avg_raw = vol_ma(vol_src, len)
+vol_dev_raw = vol_std(vol_src, len)
+
+// Robust stats (optional)
+vol_center = use_robust ? vol_median(vol_src, len) : vol_avg_raw
+vol_spread = use_robust ? vol_mad(vol_src, len) * 1.4826 : vol_dev_raw
+atr14      = ta.atr(14)
+bar_range  = high - low
+body       = math.abs(close - open)
+
+// Bands based on chosen baseline
+upper = vol_center + vol_spread * mult
+lower = math.max(vol_center - vol_spread * mult, 0.0)
+
+//=== High-volume conditions ===//
+z_score = vol_spread == 0.0 ? 0.0 : (vol_src - vol_center) / vol_spread
+
+is_high_abs   = not mode_change and volume > upper
+is_high_delta = mode_change and vol_change > upper
+is_high_z     = z_score >= mult
+
+// 24/7 markets: treat entire chart as one "session" and optionally skip first N bars
+bars_since_open   = bar_index
+session_ok = not useSessionFilter or not na(time(timeframe.period, sessionWindow))
+valid_for_session = bars_since_open > skip_open_bars and session_ok
+
+// Relative volume filter (to avoid tiny-volume spikes if you want)
+is_high_rel = vol_src > vol_avg_raw * min_rel_mult
+
+// Body/range quality filter
+body_ok  = bar_range > 0 and (body / bar_range) * 100 >= minBodyPct and bar_range >= atr14 * minRangeAtr
+
+// Synthetic delta proxy (uptick/downtick volume)
+deltaEffort   = close > close[1] ? volume : close < close[1] ? -volume : 0.0
+deltaAbs      = math.abs(deltaEffort)
+deltaBaseline = ta.sma(deltaAbs, deltaLen)
+strong_delta_up = deltaEffort > deltaBaseline * deltaMult
+strong_delta_dn = deltaEffort < -deltaBaseline * deltaMult
+venue_overlap  = useMultiVenue and not na(venue_median) and volume >= venue_median * venueAlignMult
+venue_align_ok = not useMultiVenue or not enforceVenueAlign or na(venue_median) or venue_overlap
+
+// VWAP proximity filter (optional)
+isVwapNewPeriod = switch vwapAnchor
+    "Session" => timeframe.change("D")
+    "Week"    => timeframe.change("W")
+    "Month"   => timeframe.change("M")
+    "Quarter" => timeframe.change("3M")
+    "Year"    => timeframe.change("12M")
+    => false
+[vwBase, vwUp1, vwDn1] = ta.vwap(close, isVwapNewPeriod, 1)
+vwStdev = vwUp1 - vwBase
+vwUp2 = vwBase + vwStdev * 2.0
+vwDn2 = vwBase - vwStdev * 2.0
+rollVol = useRollVwap ? ta.cum(volume) - ta.cum(volume)[rollVwapLen] : na
+rollPv  = useRollVwap ? ta.cum(close * volume) - ta.cum(close * volume)[rollVwapLen] : na
+rollVwap = useRollVwap and rollVol > 0 ? rollPv / rollVol : na
+rollDev  = useRollVwap ? ta.stdev(close, rollVwapLen) : na
+rollUp   = useRollVwap ? rollVwap + rollDev * rollBandMult : na
+rollDn   = useRollVwap ? rollVwap - rollDev * rollBandMult : na
+
+float vwapNearest = na
+if useVwapProx and not na(vwBase)
+    float minDist = na
+    float[] levels = array.new_float()
+    if vwapUse0
+        array.push(levels, vwBase)
+    if vwapUse1
+        array.push(levels, vwUp1)
+        array.push(levels, vwDn1)
+    if vwapUse2
+        array.push(levels, vwUp2)
+        array.push(levels, vwDn2)
+    if useRollVwap and not na(rollVwap)
+        array.push(levels, rollVwap)
+        if not na(rollUp)
+            array.push(levels, rollUp)
+        if not na(rollDn)
+            array.push(levels, rollDn)
+    for lvl in levels
+        d = math.abs(close - lvl)
+        minDist := na(minDist) ? d : math.min(minDist, d)
+    vwapNearest := minDist
+
+rawTol = (atr14 / close) * vwapTolAtrMult * 100
+adaptiveTolPct = math.min(vwapTolMaxPct, math.max(vwapTolMinPct, rawTol))
+effectiveTolPct = math.max(vwapTolerancePct, adaptiveTolPct)
+passesVwapProx = not useVwapProx or (not na(vwapNearest) and vwapNearest <= close * effectiveTolPct * 0.01)
+abs_tol = absorbTolPct * 0.01
+
+is_up   = close > open
+is_dn   = close < open
+
+is_high_mode =
+     mode_zscore ? is_high_z :
+     mode_change ? is_high_delta :
+                   is_high_abs
+
+delta_ok =
+     not useDeltaConfirm ? true :
+     is_up ? strong_delta_up :
+     is_dn ? strong_delta_dn :
+     false
+
+// HTF trend filter
+htf_close = request.security(syminfo.tickerid, trendTf, close)
+htf_ma    = request.security(syminfo.tickerid, trendTf, ta.sma(close, trendMaLen))
+trend_up  = htf_close > htf_ma
+trend_dn  = htf_close < htf_ma
+trend_ok  = not useTrendFilter or (is_up and trend_up) or (is_dn and trend_dn)
+
+// HTF range expansion filter
+htf_range_atr    = request.security(syminfo.tickerid, htfRangeTf, ta.atr(htfRangeLen))
+htf_range_atr_ma = request.security(syminfo.tickerid, htfRangeTf, ta.sma(ta.atr(htfRangeLen), htfAtrMaLen))
+htf_range_ok     = not useHtfRange or (htf_range_atr_ma > 0 and htf_range_atr >= htf_range_atr_ma * htfAtrFloorMult)
+
+// Extreme break filter
+swing_hi = ta.highest(high, swingLen)
+swing_lo = ta.lowest(low, swingLen)
+up_check_price = requireCloseBeyond ? close : high
+dn_check_price = requireCloseBeyond ? close : low
+breaks_up   = is_up and up_check_price >= swing_hi + tickBuffer * syminfo.mintick
+breaks_down = is_dn and dn_check_price <= swing_lo - tickBuffer * syminfo.mintick
+extreme_ok  = not useExtremeBreak or breaks_up or breaks_down
+
+// Cluster / cooldown
+var int lastSignalBar = na
+base_signal = valid_for_session and is_high_mode and is_high_rel and body_ok and passesVwapProx and delta_ok and trend_ok and htf_range_ok and extreme_ok and venue_align_ok
+base_sig_num = base_signal ? 1 : 0
+cum_base = ta.cum(base_sig_num)
+signals_in_window = requireCluster ? (bar_index >= clusterWindow ? cum_base - cum_base[clusterWindow] : cum_base) : 0
+cluster_ok = not requireCluster or signals_in_window >= 2
+cooldown_ok = na(lastSignalBar) or (bar_index - lastSignalBar > cooldownBars)
+
+is_high = base_signal and cluster_ok and cooldown_ok
+if is_high
+    lastSignalBar := bar_index
+
+// Absorption signals near contextual levels
+upper_wick_pct = bar_range > 0 ? (high - math.max(open, close)) / bar_range * 100 : 0.0
+lower_wick_pct = bar_range > 0 ? (math.min(open, close) - low) / bar_range * 100 : 0.0
+body_pct       = bar_range > 0 ? (body / bar_range) * 100 : 0.0
+
+nearAbsLevel = useAbsorb and not na(vwapNearest) and vwapNearest <= close * abs_tol
+absorb_up = nearAbsLevel and lower_wick_pct >= absorbWickPct and body_pct <= absorbBodyMaxPct and (not absorbDeltaFlip or strong_delta_up)
+absorb_dn = nearAbsLevel and upper_wick_pct >= absorbWickPct and body_pct <= absorbBodyMaxPct and (not absorbDeltaFlip or strong_delta_dn)
+
+plotshape(absorb_up, title = "Absorption Up", style = shape.circle, location = location.belowbar, color = color.new(color.teal, 0), size = size.tiny, text = "ABS↑")
+plotshape(absorb_dn, title = "Absorption Down", style = shape.circle, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny, text = "ABS↓")
+
+venue_diverge_primary = useVenueDiverge and base_signal and not na(venue_median) and volume < venue_median * venueAlignMult
+venue_diverge_venues  = useVenueDiverge and not base_signal and not na(venue_median) and volume > venue_median * venueAlignMult
+
+// Divergence tooltips
+venue_list = ""
+if useVenueDiverge
+    venue_list := appendVenue(venue_list, venue1)
+    venue_list := appendVenue(venue_list, venue2)
+    venue_list := appendVenue(venue_list, venue3)
+
+//=== Bar coloring ===//
+
+bar_col =
+     venue_diverge_primary ? divergeUpColor :
+     venue_diverge_venues  ? divergeDnColor :
+     is_up ? (is_high ? (markVenueOverlap and venue_overlap ? overlapUpColor : upHighVolColor) : upColor) :
+     is_dn ? (is_high ? (markVenueOverlap and venue_overlap ? overlapDnColor : dnHighVolColor) : dnColor) :
+     color.new(color.gray, 60)
+
+barcolor(bar_col, title = "Bar Color")
+if showVenueTooltips and (venue_diverge_primary or venue_diverge_venues)
+    label.new(bar_index, venue_diverge_primary ? high : low, text = "Divergence:\n" + venue_list, style = label.style_label_down, color = color.new(color.black, 80), textcolor = color.white, size = size.tiny)
+
+bgcolor(use_bg and is_high ? bgHighVolColor : na)
+
+//=== Failed follow-through markers ===//
+// We check high-volume bars after a lookahead window; markers are drawn on the originating bar using negative offset.
+can_eval_fail = bar_index >= failLookahead
+is_high_up_ago = can_eval_fail ? (is_high and is_up)[failLookahead] : false
+is_high_dn_ago = can_eval_fail ? (is_high and is_dn)[failLookahead] : false
+hi_ago   = can_eval_fail ? high[failLookahead] : na
+lo_ago   = can_eval_fail ? low[failLookahead]  : na
+range_ago = can_eval_fail ? math.max(hi_ago - lo_ago, syminfo.mintick) : na
+atr_ago   = can_eval_fail ? atr14[failLookahead] : na
+opp_move_thresh = can_eval_fail ? math.max(range_ago * failMovePct, atr_ago * failAtrMult) : na
+
+// Opposite follow-through after the high-volume bar:
+highest_since = ta.highest(high, failLookahead)
+lowest_since  = ta.lowest(low, failLookahead)
+
+fail_buy  = can_eval_fail and is_high_up_ago and not na(opp_move_thresh) and lowest_since < lo_ago - opp_move_thresh
+fail_sell = can_eval_fail and is_high_dn_ago and not na(opp_move_thresh) and highest_since > hi_ago + opp_move_thresh
+
+plotshape(showFailMarks and fail_buy,  title = "Failed High-Volume Buy",  style = shape.triangledown, location = location.abovebar, offset = -failLookahead, color = failBuyColor, size = size.tiny, text = "FB")
+plotshape(showFailMarks and fail_sell, title = "Failed High-Volume Sell", style = shape.triangleup,   location = location.belowbar, offset = -failLookahead, color = failSellColor, size = size.tiny, text = "FS")
+
+//=== Optional visual bands ===//
+// Removed volume band plotting to avoid misplacement in TradingView panes.
+
+// Debug: show z-score and high-flag while tuning, then comment these out
+// plot(z_score, "Z-Score", color = color.new(color.blue, 0))
+// plot(is_high ? 1 : 0, "High Flag", color = color.new(color.red, 0), style = plot.style_columns)
+
+//=== Alerts ===//
+alertcondition(is_high, "High Volume Bar", "High-volume bar detected")
+alertcondition(is_high and is_up, "High Volume Up Bar", "High-volume UP bar detected")
+alertcondition(is_high and is_dn, "High Volume Down Bar", "High-volume DOWN bar detected")
+alertcondition(fail_buy, "Failed High-Volume Buy", "High-volume buy failed to follow through")
+alertcondition(fail_sell, "Failed High-Volume Sell", "High-volume sell failed to follow through")
+alertcondition(absorb_up, "Absorption Up", "Absorption/reversal attempt up near VWAP/rolling VWAP")
+alertcondition(absorb_dn, "Absorption Down", "Absorption/reversal attempt down near VWAP/rolling VWAP")
+alertcondition(venue_diverge_primary, "Venue Divergence Primary High", "Primary exchange high-volume vs lower venue median")
+alertcondition(venue_diverge_venues, "Venue Divergence Venues High", "Venues high-volume vs lower primary")
